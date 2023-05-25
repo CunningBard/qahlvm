@@ -6,6 +6,8 @@ use std::io::Write;
 use crate::ast::{Eval, Node};
 
 
+const VARIADIC_ARG_NAME: &str = "varargs";
+
 #[derive(Debug ,Clone, PartialEq)]
 pub enum Value {
     Int(i32),
@@ -20,7 +22,84 @@ pub enum Value {
 pub trait Callable: Debug {
     fn call(&self, vm: &mut VirtualMachine, args: Vec<Eval>) -> Option<Value>;
     fn args_len(&self) -> usize;
+    fn minimum_args_len(&self) -> usize;
     fn is_variadic(&self) -> bool;
+}
+
+#[derive(Debug)]
+pub struct DefinedFunction {
+    name: String,
+    args: Vec<String>,
+    body: Vec<Node>,
+    has_variadic: bool,
+}
+
+impl DefinedFunction {
+    pub fn new(name: String, args: Vec<String>, body: Vec<Node>, last_is_variadic: bool) -> Self {
+        Self {
+            name,
+            args,
+            body,
+            has_variadic: last_is_variadic
+        }
+    }
+}
+
+impl Callable for DefinedFunction {
+    fn call(&self, vm: &mut VirtualMachine, args: Vec<Eval>) -> Option<Value> {
+        let mut assigned = vec![];
+        for (index, arg_name) in self.args.iter().enumerate() {
+            let res = vm.eval(args[index].clone());
+            vm.global_variables.insert(arg_name.clone(), res);
+            assigned.push(arg_name.clone());
+        }
+
+        if self.has_variadic {
+            let mut variadic = vec![];
+            for arg in args.into_iter().skip(self.args.len()) {
+                let res = vm.eval(arg);
+                variadic.push(res);
+            }
+            vm.global_variables.insert(VARIADIC_ARG_NAME.to_string(), Value::Array(variadic));
+            assigned.push(VARIADIC_ARG_NAME.to_string());
+        }
+
+
+
+        let mut ret = None;
+        for node in self.body.iter() {
+            match *node {
+                Node::Return(ref value) => {
+                    ret = Some(vm.eval(value.clone()));
+                    break;
+                }
+                _ => {}
+            }
+            let res = vm.single_run(node.clone());
+            if let Some(value) = res {
+                assigned.push(value);
+            }
+        }
+
+        vm.run_gc(assigned);
+        ret
+    }
+
+    fn args_len(&self) -> usize {
+        self.args.len()
+    }
+
+    fn minimum_args_len(&self) -> usize {
+        if self.has_variadic {
+            self.args.len() - 1
+        } else {
+            self.args.len()
+        }
+    }
+
+    fn is_variadic(&self) -> bool {
+        self.has_variadic
+    }
 }
 
 
@@ -48,12 +127,14 @@ impl Callable for BuiltInFunction {
         (self.func)(vm, args)
     }
 
-    fn is_variadic(&self) -> bool {
-        self.is_variadic
-    }
-
     fn args_len(&self) -> usize {
         self.args_len
+    }
+
+    fn minimum_args_len(&self) -> usize { self.args_len }
+
+    fn is_variadic(&self) -> bool {
+        self.is_variadic
     }
 }
 
@@ -203,7 +284,9 @@ pub struct VirtualMachine {
     pub objects: HashMap<usize, Object>,
     pub objects_in_use: Vec<(usize, u32)>,
     pub functions: HashMap<String, Box<dyn Callable>>,
-    pub variables: HashMap<String, Value>,
+    pub global_variables: HashMap<String, Value>,
+    pub locals: Vec<HashMap<String, Value>>, // todo
+    pub local: HashMap<String, Value>, // todo
     pub gc_approach: GcApproach,
 }
 
@@ -219,7 +302,9 @@ impl VirtualMachine {
             objects: HashMap::new(),
             objects_in_use: vec![],
             functions,
-            variables: Default::default(),
+            global_variables: Default::default(),
+            locals: vec![],
+            local: Default::default(),
             gc_approach,
         }
     }
@@ -239,7 +324,7 @@ impl VirtualMachine {
                 }
                 Value::Object(obj_id)
             }
-            Eval::VarRef(name) => { self.variables.get(&name).unwrap().clone()}
+            Eval::VarRef(name) => { self.global_variables.get(&name).unwrap().clone()}
             Eval::FnCall(func_name, args) => {
                 if !self.functions.contains_key(&*func_name){
                     panic!("Function {} does not exist", func_name);
@@ -260,10 +345,10 @@ impl VirtualMachine {
                 res
             }
             Eval::Add(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -275,10 +360,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Sub(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -289,10 +374,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Mul(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -303,10 +388,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Div(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -317,10 +402,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Mod(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -331,10 +416,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Pow(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -345,10 +430,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Eq(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -360,10 +445,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Ne(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -375,10 +460,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Gt(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -390,10 +475,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Lt(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -405,10 +490,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Ge(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -420,10 +505,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Le(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -435,10 +520,10 @@ impl VirtualMachine {
                 }
             }
             Eval::And(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -448,10 +533,10 @@ impl VirtualMachine {
                 }
             }
             Eval::Or(mut lhs, mut rhs) => {
-                lhs.deref_var_ref(&mut self.variables);
-                rhs.deref_var_ref(&mut self.variables);
-                lhs.deref_object_member(&mut self.objects, &mut self.variables);
-                rhs.deref_object_member(&mut self.objects, &mut self.variables);
+                lhs.deref_var_ref(&mut self.global_variables);
+                rhs.deref_var_ref(&mut self.global_variables);
+                lhs.deref_object_member(&mut self.objects, &mut self.global_variables);
+                rhs.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if lhs.is_an_operator(){ lhs = Box::new(self.eval(*lhs).as_eval()); }
                 if rhs.is_an_operator(){ rhs = Box::new(self.eval(*rhs).as_eval()); }
 
@@ -461,8 +546,8 @@ impl VirtualMachine {
                 }
             }
             Eval::Not(mut val) => {
-                val.deref_var_ref(&mut self.variables);
-                val.deref_object_member(&mut self.objects, &mut self.variables);
+                val.deref_var_ref(&mut self.global_variables);
+                val.deref_object_member(&mut self.objects, &mut self.global_variables);
                 if val.is_an_operator(){ val = Box::new(self.eval(*val).as_eval()); }
 
                 match *val {
@@ -476,7 +561,7 @@ impl VirtualMachine {
                 match obj_loc {
                     Value::Int(id) => { obj_id = id as usize; }
                     Value::String(var_name) => {
-                        match *self.variables.get(&var_name).unwrap() {
+                        match *self.global_variables.get(&var_name).unwrap() {
                             Value::Object(id) => { obj_id = id as usize; }
                             _ => { unreachable!()}
                         }
@@ -490,7 +575,7 @@ impl VirtualMachine {
     }
 
     fn reference_count(&mut self, variable_name: String){
-        match self.variables.get_mut(&variable_name).unwrap(){
+        match self.global_variables.get_mut(&variable_name).unwrap(){
             &mut Value::Object(id) => {
                 match self.objects_in_use.binary_search_by_key(&id, |&(a, _)| a) {
                     Ok(i) => {
@@ -501,13 +586,13 @@ impl VirtualMachine {
                             self.objects_in_use.remove(i);
                         }
 
-                        self.variables.remove(&*variable_name);
+                        self.global_variables.remove(&*variable_name);
                     }
                     _ => { unreachable!() }
                 }
             }
             _ => {
-                self.variables.remove(&*variable_name);
+                self.global_variables.remove(&*variable_name);
             }
         }
     }
@@ -612,16 +697,16 @@ impl VirtualMachine {
     fn single_run(&mut self, node: Node) -> Option<String>{
         match node {
             Node::Assign(var_name, var_value) => {
-                let already_exists = self.variables.contains_key(&var_name);
+                let already_exists = self.global_variables.contains_key(&var_name);
                 let value = self.eval(var_value);
                 self.inc_use_count(&value);
-                self.variables.insert(var_name.clone(), value);
+                self.global_variables.insert(var_name.clone(), value);
                 if !already_exists {
                     return Some(var_name);
                 }
             }
             Node::Unassign(var_name) => {
-                match self.variables.remove(&var_name) {
+                match self.global_variables.remove(&var_name) {
                     Some(val) => {
                         self.dec_use_count(&val);
                     }
@@ -714,7 +799,7 @@ impl VirtualMachine {
                 match obj_loc {
                     Value::Int(id) => { obj_id = id as usize; }
                     Value::String(var_name) => {
-                        match *self.variables.get(&var_name).unwrap() {
+                        match *self.global_variables.get(&var_name).unwrap() {
                             Value::Object(id) => { obj_id = id as usize; }
                             _ => { unreachable!()}
                         }
