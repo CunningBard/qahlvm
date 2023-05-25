@@ -11,6 +11,12 @@ QAHLVM is a rust Library, Inorder to use it you need to add it to cargo as a dep
 [dependencies]
 qahlvm = "0.1.0"
 ```
+Alternatively if you only have the source code you can
+```toml
+[dependencies]
+qahlvm = { path = "path/to/qahlvm" }
+```
+
 Then you can use it in your code like this:
 ```rust
 use qahlvm::vm::VM;
