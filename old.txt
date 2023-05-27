@@ -1,0 +1,120 @@
+fn ingle_run(&mut self, node: Node) -> Option<String>{
+        match node {
+            Node::Assign(var_name, var_value) => {
+                let value = self.eval(var_value);
+                self.global_variables.insert(var_name.clone(), value);
+                if !already_exists {
+                    return Some(var_name);
+                }
+            }
+            Node::Unassign(var_name) => {
+                match self.global_variables.remove(&var_name) {
+                    Some(val) => {
+                        self.dec_use_count(&val);
+                    }
+                    None => {
+                        panic!("Variable {} does not exist", var_name);
+                    }
+                }
+            }
+            Node::CreateObject(ptr, fields) => {
+                let obj_loc = self.eval(ptr);
+                let ptr;
+                match obj_loc {
+                    Value::Int(id) => { ptr = id as usize; }
+                    _ => { unreachable!() }
+                }
+
+                if self.objects.contains_key(&ptr) {
+                    panic!("Object already exists, Deallocate first");
+                }
+
+                let mut value = HashMap::new();
+                for field in fields {
+                    let res = self.eval(field.1);
+                    self.inc_use_count(&res);
+                    value.insert(field.0, res);
+                }
+                let object = Object::new(value);
+                self.objects.insert(ptr, object);
+            }
+            Node::DeleteObject(ptr) => {
+                let obj_loc = self.eval(ptr);
+                let ptr;
+                match obj_loc {
+                    Value::Int(id) => { ptr = id as usize; }
+                    _ => { unreachable!() }
+                }
+
+                match self.objects.remove(&ptr){
+                    None => {}
+                    Some(old) => {
+                        for (_, val) in old.fields {
+                            self.dec_use_count(&val);
+                        }
+                    }
+                }
+            }
+            Node::Conditional(conditions, else_block) => {
+                let mut ran = false;
+                for condition in conditions {
+                    if self.eval(condition.0) == Value::Bool(true) {
+                        self.multi_run(condition.1);
+                        ran = true;
+                        break;
+                    }
+                }
+
+                if !ran && !else_block.is_empty() {
+                    self.multi_run(else_block);
+                }
+            }
+            Node::Loop(nodes) => {
+                self.loop_run(nodes);
+            }
+            Node::WhileLoop(condition, body) => {
+                self.while_loop(condition, body);
+            }
+            Node::For(_, _, _) => { unimplemented!() }
+            Node::Break => { unreachable!("Break outside of loop") }
+            Node::Continue => { unreachable!("Continue outside of loop") }
+            Node::FnDef(_, _, _) => { unimplemented!()}
+            Node::Return(_) => { unreachable!("Return outside of function") }
+            Node::FnCall(name, args) => {
+                if !self.functions.contains_key(&*name){
+                    panic!("Function {} does not exist", name);
+                }
+
+                let function = self.functions.remove(&*name).unwrap();
+
+                if function.args_len() != args.len() && !function.is_variadic() {
+                    panic!("Function {} takes {} arguments, {} given", name, function.args_len(), args.len());
+                }
+
+                function.call(self, args);
+
+                self.functions.insert(name, function);
+            }
+            Node::SetMember(obj_id, member, val) => {
+                let obj_loc = self.eval(obj_id);
+                let obj_id;
+                match obj_loc {
+                    Value::Int(id) => { obj_id = id as usize; }
+                    Value::String(var_name) => {
+                        match *self.global_variables.get(&var_name).unwrap() {
+                            Value::Object(id) => { obj_id = id as usize; }
+                            _ => { unreachable!()}
+                        }
+                    }
+                    _ => { unreachable!() }
+                }
+                let res = self.eval(val);
+                self.inc_use_count(&res);
+
+                let obj = self.objects.get_mut(&(obj_id as usize)).unwrap();
+                obj.fields.insert(member, res);
+            }
+        }
+        None
+    }
+}
