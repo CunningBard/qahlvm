@@ -70,3 +70,32 @@ fn deref_object_member() {
 
     assert_eq!(val.as_int(), 1);
 }
+
+#[test]
+fn main_test(){
+    let mut vm = VirtualMachine::new(
+        GcApproach::ReferenceCounting
+    );
+
+    vm.add_defined_functions(
+        vec![
+            DefinedFunction::new(
+                "test".to_string(),
+                vec![],
+                vec![
+                    Node::Return(
+                        Eval::Int(1)
+                    )
+                ],
+                false
+            )
+        ]
+    );
+
+    let instructions = vec![
+        Node::FnCall("println".to_string(), vec![Eval::FnCall("test".to_string(), vec![])])
+    ];
+
+    vm.run(instructions);
+    println!("Done");
+}

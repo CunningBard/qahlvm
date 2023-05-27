@@ -35,23 +35,27 @@ pub struct DefinedFunction {
 }
 
 impl DefinedFunction {
-    pub fn new(name: String, args: Vec<String>, body: Vec<Node>, last_is_variadic: bool) -> Self {
+    pub fn new(name: String, args: Vec<String>, body: Vec<Node>, has_variadic: bool) -> Self {
         Self {
             name,
             args,
             body,
-            has_variadic: last_is_variadic
+            has_variadic
         }
     }
 }
 
 impl Callable for DefinedFunction {
     fn call(&self, vm: &mut VirtualMachine, args: Vec<Eval>) -> Option<Value> {
-        let mut assigned = vec![];
+        println!("Calling function: {}", self.name);
+        if vm.local.is_some() {
+            vm.locals.push(vm.local.take().unwrap());
+        }
+
+        vm.local = Some(HashMap::new());
         for (index, arg_name) in self.args.iter().enumerate() {
             let res = vm.eval(args[index].clone());
-            vm.global_variables.insert(arg_name.clone(), res);
-            assigned.push(arg_name.clone());
+            vm.local.as_mut().unwrap().insert(arg_name.to_string(), res);
         }
 
         if self.has_variadic {
@@ -60,10 +64,8 @@ impl Callable for DefinedFunction {
                 let res = vm.eval(arg);
                 variadic.push(res);
             }
-            vm.global_variables.insert(VARIADIC_ARG_NAME.to_string(), Value::Array(variadic));
-            assigned.push(VARIADIC_ARG_NAME.to_string());
+            vm.local.as_mut().unwrap().insert(VARIADIC_ARG_NAME.to_string(), Value::Array(variadic));
         }
-
 
 
         let mut ret = None;
@@ -73,15 +75,14 @@ impl Callable for DefinedFunction {
                     ret = Some(vm.eval(value.clone()));
                     break;
                 }
-                _ => {}
-            }
-            let res = vm.single_run(node.clone());
-            if let Some(value) = res {
-                assigned.push(value);
+                _ => {
+                    vm.single_run(node.clone());
+                }
             }
         }
 
-        vm.run_gc(assigned);
+        vm.local = vm.locals.pop();
+
         ret
     }
 
@@ -156,7 +157,9 @@ pub fn println_array(val: &Vec<Value>){
             Value::Float(val) => { print!("{}", val) }
             Value::String(val) => { print!("\"{}\"", val) }
             Value::Object(val) => { print!("Object <{:#08x}>", val) }
-            Value::Array(val) => { println_array(val) }
+            Value::Array(val) => {
+                println_array(&val)
+            }
         }
     }
     print!("]");
@@ -285,8 +288,8 @@ pub struct VirtualMachine {
     pub objects_in_use: Vec<(usize, u32)>,
     pub functions: HashMap<String, Box<dyn Callable>>,
     pub global_variables: HashMap<String, Value>,
-    pub locals: Vec<HashMap<String, Value>>, // todo
-    pub local: HashMap<String, Value>, // todo
+    pub locals: Vec<HashMap<String, Value>>,
+    pub local: Option<HashMap<String, Value>>,
     pub gc_approach: GcApproach,
 }
 
@@ -309,6 +312,18 @@ impl VirtualMachine {
         }
     }
 
+    pub fn add_defined_functions(&mut self, functions: Vec<DefinedFunction>) {
+        for func in functions {
+            self.functions.insert(func.name.clone(), Box::new(func) as Box<dyn Callable>);
+        }
+    }
+
+    pub fn add_rust_functions(&mut self, functions: Vec<BuiltInFunction>) {
+        for func in functions {
+            self.functions.insert(func.name.clone(), Box::new(func) as Box<dyn Callable>);
+        }
+    }
+
     pub fn eval(&mut self, val: Eval) -> Value {
         match val {
             Eval::Int(i) => { Value::Int(i) }
@@ -324,7 +339,21 @@ impl VirtualMachine {
                 }
                 Value::Object(obj_id)
             }
-            Eval::VarRef(name) => { self.global_variables.get(&name).unwrap().clone()}
+            Eval::VarRef(name) => {
+                // old
+                // self.global_variables.get(&name).unwrap().clone()
+
+                // new
+                if self.local.is_some(){
+                    return if let Some(val) = self.local.as_ref().unwrap().get(&name) {
+                        val.clone()
+                    } else {
+                        self.global_variables.get(&name).unwrap().clone()
+                    }
+                } else {
+                    self.global_variables.get(&name).unwrap().clone()
+                }
+            }
             Eval::FnCall(func_name, args) => {
                 if !self.functions.contains_key(&*func_name){
                     panic!("Function {} does not exist", func_name);
@@ -694,24 +723,40 @@ impl VirtualMachine {
         self.run_gc(assigned);
     }
 
-    fn single_run(&mut self, node: Node) -> Option<String>{
+    fn single_run(&mut self, node: Node) -> Option<String> {
+        // also handle local variables
         match node {
-            Node::Assign(var_name, var_value) => {
-                let already_exists = self.global_variables.contains_key(&var_name);
-                let value = self.eval(var_value);
-                self.inc_use_count(&value);
-                self.global_variables.insert(var_name.clone(), value);
-                if !already_exists {
-                    return Some(var_name);
+            Node::Assign(var_name, var_val) => {
+                if self.local.is_some(){
+                    if self.global_variables.contains_key(&*var_name){
+                        panic!("Variable {} already exists globally", var_name);
+                    }
+
+                    let val = self.eval(var_val);
+                    self.local.as_mut().unwrap().insert(var_name, val);
+
+                } else {
+                    let val = self.eval(var_val);
+                    self.global_variables.insert(var_name.clone(), val);
                 }
             }
             Node::Unassign(var_name) => {
-                match self.global_variables.remove(&var_name) {
-                    Some(val) => {
-                        self.dec_use_count(&val);
+                if self.local.is_some(){
+                    match self.local.as_mut().unwrap().remove(&*var_name) {
+                        Some(val) => {
+                            self.dec_use_count(&val);
+                        }
+                        None => {
+                            match self.global_variables.remove(&*var_name) {
+                                Some(val) => { self.dec_use_count(&val); }
+                                None => { panic!("Variable {} does not exist", var_name); }
+                            }
+                        }
                     }
-                    None => {
-                        panic!("Variable {} does not exist", var_name);
+                } else {
+                    match self.global_variables.remove(&*var_name) {
+                        Some(val) => { self.dec_use_count(&val); }
+                        None => { panic!("Variable {} does not exist", var_name); }
                     }
                 }
             }
